@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  fastapi:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    build: .
+    shm_size: '4g' 
+    expose:
+      - "8000"
+    volumes:
+      - /data/model-store/huggingface:/root/.cache/huggingface
+    networks:
+      - hermes-network
+
+  nginx:
+    image: nginx:latest
+    container_name: hermes_reverse_proxy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - fastapi
+    networks:
+      - hermes-network
+networks:
+  hermes-network:
+    driver: bridge
