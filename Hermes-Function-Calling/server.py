@@ -1,50 +1,59 @@
 import torch
+import time
+import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import uvicorn
 
-# --- Model Configuration ---
 MODEL_PATH = "NousResearch/Hermes-2-Pro-Llama-3-8B"
-CHAT_TEMPLATE = "chatml"
-LOAD_IN_4BIT = False 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- FastAPI App Initialization ---
+ml_models = {}
 app = FastAPI()
 
-# --- Load Model and Tokenizer ---
-print("Loading model and tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    torch_dtype=torch.bfloat16,
-    load_in_4bit=LOAD_IN_4BIT,
-    device_map="auto"
-)
-print("Model and tokenizer loaded successfully.")
+@app.on_event("startup")
+async def startup_event():
+    logging.info("Loading model and tokenizer...")
+    ml_models["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_PATH)
+    ml_models["model"] = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    logging.info("Model and tokenizer loaded successfully.")
 
-# --- Pydantic Model for Request Body ---
+@app.on_event("shutdown")
+async def shutdown_event():
+    logging.info("Shutdown event: Cleaning up and shutting down.")
+    ml_models.clear()
+
+
 class D3Request(BaseModel):
     raw_data: str
     chart_type: str
-    data_type: str # "JSON" or "CSV"
+    data_type: str
 
-# --- Helper Function for Prompting ---
+class ChatRequest(BaseModel):
+    messages: list
+
 def create_d3_prompt(raw_data: str, chart_type: str, data_type: str) -> str:
-    """Creates the prompt for the model to generate D3.js code."""
+    tokenizer = ml_models.get("tokenizer")
+    if not tokenizer:
+        raise RuntimeError("Tokenizer not loaded. The application might not have started correctly.")
+
     system_prompt = (
         "You are an expert D3.js developer. Your task is to generate a complete, "
         "self-contained D3.js script (without the script tags) to visualize the provided data. "
         "The script must handle its own data parsing and rendering."
     )
     
-    user_prompt = "" 
+    user_prompt = ""
     data_block = ""
     
-    # Define data block based on type
     if data_type == "CSV":
         data_block = f"const csvData = `\n{raw_data}\n`;"
-    else: # JSON
+    else:
         data_block = f"const jsonData = `{raw_data}`;"
 
 
@@ -55,7 +64,7 @@ def create_d3_prompt(raw_data: str, chart_type: str, data_type: str) -> str:
                 "1. The CSV data is provided in a constant named `csvData`. Parse it using `d3.csvParse()`.\n"
                 "2. **MOST IMPORTANT STEP:** After parsing, convert the 'value' strings to numbers using this exact code: `data.forEach(d => { d.value = +d.value; });`.\n"
             )
-        else: # JSON
+        else:
             data_handling_steps = (
                 "1. The JSON data is provided in a constant named `jsonData`. Parse it using `JSON.parse()`.\n"
             )
@@ -76,7 +85,6 @@ def create_d3_prompt(raw_data: str, chart_type: str, data_type: str) -> str:
         )
 
     elif chart_type == "Pie Chart":
-        # Pie chart prompt remains the same as it was already robust
         data_format_instructions = ""
         if data_type == "CSV":
              data_format_instructions = (
@@ -85,7 +93,7 @@ def create_d3_prompt(raw_data: str, chart_type: str, data_type: str) -> str:
                 "1. Parse the provided CSV string into an array of objects. **You MUST use `d3.csvParse()` for this.**\n"
                 "2. After parsing, you MUST iterate through the data and convert the numeric 'value' column to a number, for example: `data.forEach(d => { d.value = +d.value; });` This is a critical step.\n\n"
             )
-        else: # JSON
+        else:
             data_format_instructions = "The data is provided as a single JSON string. The script should parse it before use.\n\n"
 
         user_prompt = (
@@ -105,34 +113,38 @@ def create_d3_prompt(raw_data: str, chart_type: str, data_type: str) -> str:
             "   b. The second tspan for the value: `.append('tspan').attr('x', 0).attr('y', '0.7em').attr('fill-opacity', 0.7).text(d => d.data.value)`\n"
             "Do not include any HTML or CSS, only the standalone Javascript code."
         )
-    
-    # Apply the ChatML template
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     
     prompt = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
+        messages,
+        tokenize=False,
         add_generation_prompt=True
     )
     return prompt
 
-# API Endpoint
+
 @app.post("/generate_d3")
 def generate_d3(request: D3Request):
-    """
-    Generates D3.js code from raw data using the Hermes model.
-    """
+    model = ml_models.get("model")
+    tokenizer = ml_models.get("tokenizer")
+    if not model or not tokenizer:
+        return {"error": "Model not loaded. Please check server logs."}, 503
+
+    total_time = 0
+    gpu_time = 0
+    total_start_time = time.perf_counter()
     try:
-        # Create the prompt
         prompt = create_d3_prompt(request.raw_data, request.chart_type, request.data_type)
         
-        # Tokenize the input
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
-        # Generate the output
+        input_length = inputs.input_ids.shape[1]
+
+        gpu_start_time = time.perf_counter()
         outputs = model.generate(
             **inputs,
             max_new_tokens=2048,
@@ -142,22 +154,65 @@ def generate_d3(request: D3Request):
             temperature=0.3,
             top_p=0.9,
         )
-        
-        # Decode the response and clean it up
+        gpu_end_time = time.perf_counter()
+
         response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the code part from the model's response
+    
         assistant_response = response_text.split("<|im_start|>assistant\n")[-1]
 
-        # Clean up common code block markers
         if "```javascript" in assistant_response:
             assistant_response = assistant_response.split("```javascript\n")[1]
         if "```" in assistant_response:
             assistant_response = assistant_response.split("```")[0]
+        
+        total_end_time = time.perf_counter()
+
+        total_time = total_end_time - total_start_time
+        gpu_time = gpu_end_time - gpu_start_time
+        num_generated_tokens = outputs.shape[1] - input_length
+        tokens_per_second = num_generated_tokens / gpu_time if gpu_time > 0 else 0
+        
+        logging.info(f"--- INFERENCE METRICS ---")
+        logging.info(f"Total Request Time: {total_time:.2f} seconds")
+        logging.info(f"GPU Generation Time: {gpu_time:.2f} seconds")
+        logging.info(f"Tokens Generated: {num_generated_tokens}")
+        logging.info(f"Tokens/Second (GPU Speed): {tokens_per_second:.2f}")
+        logging.info(f"-------------------------")
             
         return {"d3_code": assistant_response.strip()}
 
     except Exception as e:
+        logging.error(f"An error occurred during D3 generation: {e}", exc_info=True)
+        return {"error": str(e)}
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    Handles generic chat requests with the Hermes model.
+    """
+    model = ml_models.get("model")
+    tokenizer = ml_models.get("tokenizer")
+    if not model or not tokenizer:
+        return {"error": "Model not loaded. Please check server logs."}, 503
+
+    try:
+        prompt = tokenizer.apply_chat_template(
+            request.messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        outputs = model.generate(**inputs, max_new_tokens=512)
+        response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        assistant_response = response_text.split("<|im_start|>assistant\n")[-1].strip()
+
+        return {"response": assistant_response}
+
+    except Exception as e:
+        logging.error(f"An error occurred during chat generation: {e}", exc_info=True)
         return {"error": str(e)}
 
 
