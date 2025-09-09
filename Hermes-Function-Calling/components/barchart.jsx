@@ -9,13 +9,13 @@ const BarChart = ({ data, xAxisKey, yAxisKey }) => {
       // Clear previous SVG
       d3.select(d3Container.current).selectAll('*').remove();
 
-      // Ensure data is correctly typed (especially the numeric value)
+      
       const typedData = data.map(d => ({
         ...d,
         [yAxisKey]: +d[yAxisKey]
       }));
 
-      // --- D3 Logic from our perfected prompt ---
+    
       const margin = { top: 20, right: 20, bottom: 40, left: 50 };
       const width = 500 - margin.left - margin.right;
       const height = 350 - margin.top - margin.bottom;
@@ -35,18 +35,18 @@ const BarChart = ({ data, xAxisKey, yAxisKey }) => {
 
       const yScale = d3.scaleLinear()
         .domain([0, d3.max(typedData, d => d[yAxisKey])])
-        .range([height, 0]); // Correctly inverted range
+        .range([height, 0]); 
 
-      // X-Axis
+      
       g.append('g')
         .attr('transform', `translate(0, ${height})`)
         .call(d3.axisBottom(xScale));
 
-      // Y-Axis
+    
       g.append('g')
         .call(d3.axisLeft(yScale));
 
-      // Rectangles
+     
       g.selectAll('rect')
         .data(typedData)
         .join('rect')
@@ -56,7 +56,7 @@ const BarChart = ({ data, xAxisKey, yAxisKey }) => {
         .attr('height', d => height - yScale(d[yAxisKey]))
         .attr('fill', 'steelblue');
     }
-  }, [data, xAxisKey, yAxisKey]); // Rerun effect if data or keys change
+  }, [data, xAxisKey, yAxisKey]); 
 
   return (
     <div ref={d3Container} />
